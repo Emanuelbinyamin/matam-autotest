@@ -22,16 +22,18 @@ from typing import List, Optional, Tuple
 # ─────────────────────────────────────────────────────────────── Palette ──
 
 class _C:
-    RESET   = "\033[0m"
-    BOLD    = "\033[1m"
-    DIM     = "\033[2m"
-    RED     = "\033[91m"
-    GREEN   = "\033[92m"
-    YELLOW  = "\033[93m"
-    CYAN    = "\033[96m"
-    MAGENTA = "\033[95m"
-    BLUE    = "\033[94m"
-    WHITE   = "\033[97m"
+    RESET    = "\033[0m"
+    BOLD     = "\033[1m"
+    DIM      = "\033[2m"
+    RED      = "\033[91m"
+    GREEN    = "\033[92m"
+    YELLOW   = "\033[93m"
+    CYAN     = "\033[96m"
+    MAGENTA  = "\033[95m"
+    BLUE     = "\033[94m"
+    WHITE    = "\033[97m"
+    BG_RED   = "\033[41m"   # background: used for intra-line deletion highlights
+    BG_GREEN = "\033[42m"   # background: used for intra-line addition highlights
 
 
 def _col(text: str, *codes: str) -> str:
@@ -45,6 +47,10 @@ def c_header(t: str) -> str: return _col(t, _C.BOLD, _C.MAGENTA)
 def c_git(t: str)    -> str: return _col(t, _C.BOLD, _C.BLUE)
 def c_dim(t: str)    -> str: return _col(t, _C.DIM)
 def c_bold(t: str)   -> str: return _col(t, _C.BOLD, _C.WHITE)
+
+# Intra-line diff highlight styles (applied to individual changed characters)
+_HL_DEL = _C.BOLD + _C.BG_RED   + _C.WHITE    # bold · red bg · white fg   → deleted chars
+_HL_ADD = _C.BOLD + _C.BG_GREEN + "\033[30m"  # bold · green bg · black fg → added chars
 
 
 # ──────────────────────────────────────────────────────────── Constants ──
@@ -81,13 +87,14 @@ class TestResult:
 
 @dataclass
 class GitResult:
-    attempted: bool  = False
-    add_ok: bool     = False
-    commit_ok: bool  = False
-    push_ok: bool    = False
-    commit_msg: str  = ""
-    push_out: str    = ""
-    error: str       = ""
+    attempted: bool          = False
+    clean_ok: Optional[bool] = None   # None = no Makefile present; True/False = make clean result
+    add_ok: bool             = False
+    commit_ok: bool          = False
+    push_ok: bool            = False
+    commit_msg: str          = ""
+    push_out: str            = ""
+    error: str               = ""
 
 
 # ───────────────────────────────────────────────────── Test discovery ──
@@ -234,17 +241,103 @@ def run_valgrind(binary: str, in_path: Path, timeout: float) -> Tuple[bool, str]
         return False, "valgrind not found in PATH."
 
 
+# ──────────────────────────────────────────── Intra-line diff engine ──
+
+def _vis(s: str) -> str:
+    """
+    Make invisible whitespace characters visible inside a highlight span.
+    A trailing space is the single most common cause of a silent test failure;
+    this makes it impossible to miss.
+    """
+    return s.replace(" ", "·").replace("\t", "→")
+
+
+def _highlight_inline(removed: str, added: str) -> Tuple[str, str]:
+    """
+    Given one removed line and one added line, return both with character-level
+    differences highlighted using ANSI background colours.
+
+    Uses difflib.SequenceMatcher (stdlib only, zero external dependencies).
+    SequenceMatcher.get_opcodes() returns a list of (tag, i1, i2, j1, j2) tuples:
+      'equal'   → identical segment: emit as-is on both sides
+      'replace' → substitution: highlight both segments
+      'delete'  → chars in removed only: highlight on removed side
+      'insert'  → chars in added only:   highlight on added side
+
+    Whitespace-only differences (trailing spaces, etc.) are passed through _vis()
+    so they render as visible glyphs inside the coloured background span.
+    """
+    matcher = difflib.SequenceMatcher(None, removed, added, autojunk=False)
+    r_parts: List[str] = []
+    a_parts: List[str] = []
+
+    for op, i1, i2, j1, j2 in matcher.get_opcodes():
+        r_seg = removed[i1:i2]
+        a_seg = added[j1:j2]
+
+        if op == "equal":
+            r_parts.append(r_seg)
+            a_parts.append(a_seg)
+        elif op == "replace":
+            r_parts.append(_HL_DEL + _vis(r_seg) + _C.RESET)
+            a_parts.append(_HL_ADD + _vis(a_seg) + _C.RESET)
+        elif op == "delete":
+            r_parts.append(_HL_DEL + _vis(r_seg) + _C.RESET)
+        elif op == "insert":
+            a_parts.append(_HL_ADD + _vis(a_seg) + _C.RESET)
+
+    return "".join(r_parts), "".join(a_parts)
+
+
 # ─────────────────────────────────────────────────── Output renderers ──
 
 def _render_diff(diff: str) -> None:
+    """
+    Render a unified diff with intra-line character-level highlighting.
+
+    Scan the diff with a manual index.  When a run of '-' lines is immediately
+    followed by a run of '+' lines (an edit block), pair them 1-to-1 and call
+    _highlight_inline on each pair.  Surplus unpaired lines (pure insertions or
+    pure deletions) are rendered with standard line-level colour only.
+    """
     print(c_info("   ── diff  (─ expected  /  + actual) ──"))
-    for line in diff.splitlines():
-        if   line.startswith("+") and not line.startswith("+++"):
+    lines = diff.splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+
+        if line.startswith("-") and not line.startswith("--- "):
+            # Collect the full run of deleted lines
+            del_buf: List[str] = []
+            while i < len(lines) and lines[i].startswith("-") and not lines[i].startswith("--- "):
+                del_buf.append(lines[i][1:])
+                i += 1
+            # Collect the full run of added lines immediately following
+            add_buf: List[str] = []
+            while i < len(lines) and lines[i].startswith("+") and not lines[i].startswith("+++ "):
+                add_buf.append(lines[i][1:])
+                i += 1
+
+            pairs = min(len(del_buf), len(add_buf))
+
+            # Paired lines → intra-line character highlighting
+            for j in range(pairs):
+                r_hl, a_hl = _highlight_inline(del_buf[j], add_buf[j])
+                print(f"   {_C.RED}-{r_hl}{_C.RESET}")
+                print(f"   {_C.GREEN}+{a_hl}{_C.RESET}")
+
+            # Surplus unpaired lines → standard line-level colour
+            for j in range(pairs, len(del_buf)):
+                print(c_fail(f"   -{del_buf[j]}"))
+            for j in range(pairs, len(add_buf)):
+                print(c_ok(f"   +{add_buf[j]}"))
+
+        elif line.startswith("+") and not line.startswith("+++ "):
             print(c_ok(f"   {line}"))
-        elif line.startswith("-") and not line.startswith("---"):
-            print(c_fail(f"   {line}"))
+            i += 1
         else:
             print(c_dim(f"   {line}"))
+            i += 1
 
 
 def _render_valgrind(log: str) -> None:
@@ -362,6 +455,13 @@ def run_git_workflow(message: str) -> GitResult:
         gr.error = "Not a Git repository."
         return gr
 
+    # Wipe compiled artifacts before staging.  A Makefile project that skips
+    # this step will commit *.o files and the binary into the remote repository.
+    has_makefile = Path("Makefile").exists() or Path("makefile").exists()
+    if has_makefile:
+        res = subprocess.run(["make", "clean"], capture_output=True)
+        gr.clean_ok = (res.returncode == 0)
+
     gr.add_ok = (
         subprocess.run(["git", "add", "."], capture_output=True).returncode == 0
     )
@@ -386,6 +486,10 @@ def run_git_workflow(message: str) -> GitResult:
 
 def print_git_result(gr: GitResult) -> None:
     print(c_git("\n  GIT WORKFLOW\n  " + "─" * 62))
+    if gr.clean_ok is True:
+        print(c_ok("  ✓ make clean"))
+    elif gr.clean_ok is False:
+        print(c_warn("  ⚠ make clean failed — binaries may be staged"))
     print(f"  {'✓' if gr.add_ok else '✗'} git add .")
     if gr.commit_ok:
         print(f"  ✓ git commit -m \"[Autotest] {gr.commit_msg}\"")
@@ -461,7 +565,7 @@ def main() -> None:
     source = Path(args.source)
 
     print(c_header(
-        f"\n╔══ autotest v3 ════════════════════════════════════════════════╗\n"
+        f"\n╔══ autotest v4 ════════════════════════════════════════════════╗\n"
         f"║  Target : {str(source):<54}║\n"
         f"╚═══════════════════════════════════════════════════════════════╝\n"
     ))
