@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 autotest — Matam Auto-Test  (Technion 234124)
-Strict-compilation, I/O diffing, Valgrind, and Git workflow in one command.
+Strict-compilation, I/O diffing, Valgrind, Parallel Testing, and Git workflow.
 """
 
 import argparse
@@ -33,8 +33,8 @@ class _C:
     MAGENTA  = "\033[95m"
     BLUE     = "\033[94m"
     WHITE    = "\033[97m"
-    BG_RED   = "\033[41m"   # background: used for intra-line deletion highlights
-    BG_GREEN = "\033[42m"   # background: used for intra-line addition highlights
+    BG_RED   = "\033[41m"   
+    BG_GREEN = "\033[42m"   
 
 
 def _col(text: str, *codes: str) -> str:
@@ -49,9 +49,8 @@ def c_git(t: str)    -> str: return _col(t, _C.BOLD, _C.BLUE)
 def c_dim(t: str)    -> str: return _col(t, _C.DIM)
 def c_bold(t: str)   -> str: return _col(t, _C.BOLD, _C.WHITE)
 
-# Intra-line diff highlight styles (applied to individual changed characters)
-_HL_DEL = _C.BOLD + _C.BG_RED   + _C.WHITE    # bold · red bg · white fg   → deleted chars
-_HL_ADD = _C.BOLD + _C.BG_GREEN + "\033[30m"  # bold · green bg · black fg → added chars
+_HL_DEL = _C.BOLD + _C.BG_RED   + _C.WHITE    
+_HL_ADD = _C.BOLD + _C.BG_GREEN + "\033[30m"  
 
 
 # ──────────────────────────────────────────────────────────── Constants ──
@@ -89,7 +88,7 @@ class TestResult:
 @dataclass
 class GitResult:
     attempted: bool          = False
-    clean_ok: Optional[bool] = None   # None = no Makefile present; True/False = make clean result
+    clean_ok: Optional[bool] = None   
     add_ok: bool             = False
     commit_ok: bool          = False
     push_ok: bool            = False
@@ -127,12 +126,6 @@ def discover_tests(tests_dir: str) -> List[TestCase]:
 # ──────────────────────────────────────────────────────── Compilation ──
 
 def _infer_makefile_binary(source_stem: str) -> str:
-    """
-    Parse the Makefile for a common target-variable declaration
-    (EXEC, TARGET, BIN, or PROG).  Falls back to the source file stem.
-
-    Handles both '= value' and ':= value' assignment forms.
-    """
     var_pattern = re.compile(
         r"^(?:EXEC|TARGET|BIN|PROG)\s*(?::?=)\s*(\S+)", re.IGNORECASE
     )
@@ -148,12 +141,6 @@ def _infer_makefile_binary(source_stem: str) -> str:
 
 
 def compile_cpp(source_path: str, tmp_binary: str) -> Tuple[bool, str, str]:
-    """
-    Compile source_path.  Returns (success, compiler_output, resolved_binary_path).
-
-    Uses Makefile when present; falls back to a direct g++ invocation.
-    The returned binary path is verified to exist by the caller.
-    """
     has_makefile = Path("Makefile").exists() or Path("makefile").exists()
 
     if has_makefile:
@@ -187,10 +174,6 @@ def compile_cpp(source_path: str, tmp_binary: str) -> Tuple[bool, str, str]:
 def run_program(
     cmd: List[str], in_path: Path, timeout: float
 ) -> Tuple[bool, str, str, bool, float]:
-    """
-    Execute cmd with in_path fed to stdin.
-    Returns (exit_ok, stdout, stderr, timed_out, elapsed_secs).
-    """
     try:
         with in_path.open("r", encoding="utf-8") as fh:
             t0 = time.monotonic()
@@ -214,10 +197,6 @@ def run_program(
 
 
 def run_valgrind(binary: str, in_path: Path, timeout: float) -> Tuple[bool, str]:
-    """
-    Run Valgrind over binary with in_path on stdin.
-    Returns (no_memory_errors, valgrind_stderr).
-    """
     try:
         with in_path.open("r", encoding="utf-8") as fh:
             res = subprocess.run(
@@ -245,29 +224,10 @@ def run_valgrind(binary: str, in_path: Path, timeout: float) -> Tuple[bool, str]
 # ──────────────────────────────────────────── Intra-line diff engine ──
 
 def _vis(s: str) -> str:
-    """
-    Make invisible whitespace characters visible inside a highlight span.
-    A trailing space is the single most common cause of a silent test failure;
-    this makes it impossible to miss.
-    """
     return s.replace(" ", "·").replace("\t", "→")
 
 
 def _highlight_inline(removed: str, added: str) -> Tuple[str, str]:
-    """
-    Given one removed line and one added line, return both with character-level
-    differences highlighted using ANSI background colours.
-
-    Uses difflib.SequenceMatcher (stdlib only, zero external dependencies).
-    SequenceMatcher.get_opcodes() returns a list of (tag, i1, i2, j1, j2) tuples:
-      'equal'   → identical segment: emit as-is on both sides
-      'replace' → substitution: highlight both segments
-      'delete'  → chars in removed only: highlight on removed side
-      'insert'  → chars in added only:   highlight on added side
-
-    Whitespace-only differences (trailing spaces, etc.) are passed through _vis()
-    so they render as visible glyphs inside the coloured background span.
-    """
     matcher = difflib.SequenceMatcher(None, removed, added, autojunk=False)
     r_parts: List[str] = []
     a_parts: List[str] = []
@@ -293,47 +253,35 @@ def _highlight_inline(removed: str, added: str) -> Tuple[str, str]:
 # ─────────────────────────────────────────────────── Output renderers ──
 
 def _render_diff(diff: str) -> None:
-    """
-    Render a unified diff with intra-line character-level highlighting.
-
-    Scan the diff with a manual index.  When a run of '-' lines is immediately
-    followed by a run of '+' lines (an edit block), pair them 1-to-1 and call
-    _highlight_inline on each pair.  Surplus unpaired lines (pure insertions or
-    pure deletions) are rendered with standard line-level colour only.
-    """
     print(c_info("   ── diff  (─ expected  /  + actual) ──"))
     lines = diff.splitlines()
     i = 0
     while i < len(lines):
         line = lines[i]
 
-        if line.startswith("-") and not line.startswith("---"):
-            # Collect the full run of deleted lines
+        if line.startswith("-") and not line.startswith("--- "):
             del_buf: List[str] = []
-            while i < len(lines) and lines[i].startswith("-") and not lines[i].startswith("---"):
+            while i < len(lines) and lines[i].startswith("-") and not lines[i].startswith("--- "):
                 del_buf.append(lines[i][1:])
                 i += 1
-            # Collect the full run of added lines immediately following
             add_buf: List[str] = []
-            while i < len(lines) and lines[i].startswith("+") and not lines[i].startswith("+++"):
+            while i < len(lines) and lines[i].startswith("+") and not lines[i].startswith("+++ "):
                 add_buf.append(lines[i][1:])
                 i += 1
 
             pairs = min(len(del_buf), len(add_buf))
 
-            # Paired lines → intra-line character highlighting
             for j in range(pairs):
                 r_hl, a_hl = _highlight_inline(del_buf[j], add_buf[j])
                 print(f"   {_C.RED}-{r_hl}{_C.RESET}")
                 print(f"   {_C.GREEN}+{a_hl}{_C.RESET}")
 
-            # Surplus unpaired lines → standard line-level colour
             for j in range(pairs, len(del_buf)):
                 print(c_fail(f"   -{del_buf[j]}"))
             for j in range(pairs, len(add_buf)):
                 print(c_ok(f"   +{add_buf[j]}"))
 
-        elif line.startswith("+") and not line.startswith("+++"):
+        elif line.startswith("+") and not line.startswith("+++ "):
             print(c_ok(f"   {line}"))
             i += 1
         else:
@@ -382,9 +330,10 @@ def _run_single_test(
     use_valgrind: bool,
     bin_path: Optional[str],
 ) -> TestResult:
-    """Pure computation: run one test, return its result. No I/O side effects."""
     expected_text = tc.expected_path.read_text(encoding="utf-8")
-    ok, out, err, timed_out, elapsed = run_program(cmd, tc.input_path, timeout)
+    
+    prog_timeout = timeout * VALGRIND_TIMEOUT_MULTIPLIER if use_valgrind else timeout
+    ok, out, err, timed_out, elapsed = run_program(cmd, tc.input_path, prog_timeout)
 
     if timed_out:
         return TestResult(tc, passed=False, timed_out=True)
@@ -413,33 +362,44 @@ def execute_tests(
     timeout: float,
     use_valgrind: bool,
     bin_path: Optional[str],
+    max_workers: Optional[int] = None,
 ) -> List[TestResult]:
-    """Orchestrate test execution and stream per-test output to stdout."""
-    results: List[TestResult] = []
+    results_dict: Dict[int, TestResult] = {}
+    futures_map = {}
 
-    for idx, tc in enumerate(tests, 1):
-        result = _run_single_test(tc, cmd, timeout, use_valgrind, bin_path)
-        label  = f"[{idx}/{len(tests)}] {c_bold(tc.name)}"
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        for idx, tc in enumerate(tests, 1):
+            f = executor.submit(_run_single_test, tc, cmd, timeout, use_valgrind, bin_path)
+            futures_map[f] = idx
 
-        if result.timed_out:
-            print(f"  {c_fail('✗ TIMEOUT')} {label}")
-        else:
-            mem_tag = (
-                f"  {c_ok('✓ memcheck')}"  if result.mem_ok is True  else
-                f"  {c_fail('✗ memleak')}" if result.mem_ok is False else
-                ""
-            )
-            status = c_ok("✓ PASS") if result.passed else c_fail("✗ FAIL")
-            print(f"  {status} {label}  {result.runtime_secs * 1000:.1f}ms{mem_tag}")
+        next_to_print = 1
+        for future in concurrent.futures.as_completed(futures_map):
+            idx = futures_map[future]
+            results_dict[idx] = future.result()
 
-            if not result.passed:
-                _render_diff(result.unified_diff)
-            elif result.mem_ok is False:
-                _render_valgrind(result.valgrind_log)
+            while next_to_print in results_dict:
+                res   = results_dict[next_to_print]
+                label = f"[{next_to_print}/{len(tests)}] {c_bold(res.test.name)}"
 
-        results.append(result)
+                if res.timed_out:
+                    print(f"  {c_fail('✗ TIMEOUT')} {label}")
+                else:
+                    mem_tag = (
+                        f"  {c_ok('✓ memcheck')}"  if res.mem_ok is True  else
+                        f"  {c_fail('✗ memleak')}" if res.mem_ok is False else
+                        ""
+                    )
+                    status = c_ok("✓ PASS") if res.passed else c_fail("✗ FAIL")
+                    print(f"  {status} {label}  {res.runtime_secs * 1000:.1f}ms{mem_tag}")
 
-    return results
+                    if not res.passed:
+                        _render_diff(res.unified_diff)
+                    elif res.mem_ok is False:
+                        _render_valgrind(res.valgrind_log)
+
+                next_to_print += 1
+
+    return [results_dict[i] for i in sorted(results_dict.keys())]
 
 
 # ──────────────────────────────────────────────────────── Git workflow ──
@@ -447,7 +407,6 @@ def execute_tests(
 def run_git_workflow(message: str) -> GitResult:
     gr = GitResult(attempted=True, commit_msg=message)
 
-    # --git-dir exits non-zero if not inside a repository.
     if subprocess.run(
         ["git", "rev-parse", "--git-dir"],
         stdout=subprocess.DEVNULL,
@@ -456,8 +415,6 @@ def run_git_workflow(message: str) -> GitResult:
         gr.error = "Not a Git repository."
         return gr
 
-    # Wipe compiled artifacts before staging.  A Makefile project that skips
-    # this step will commit *.o files and the binary into the remote repository.
     has_makefile = Path("Makefile").exists() or Path("makefile").exists()
     if has_makefile:
         res = subprocess.run(["make", "clean"], capture_output=True)
@@ -522,7 +479,7 @@ def pack_submission(student_id: str, any_failure: bool) -> None:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="autotest",
-        description="Matam auto-tester: compile, I/O diff, Valgrind, Git.",
+        description="Matam auto-tester: compile, I/O diff, Valgrind, Git, Concurrency.",
     )
     p.add_argument(
         "source",
@@ -556,6 +513,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Skip Valgrind memory checks.",
     )
+    p.add_argument(
+        "--workers",
+        metavar="NUM",
+        type=int,
+        default=None,
+        help="Number of parallel worker threads for test execution (default: Core count).",
+    )
     return p
 
 
@@ -566,7 +530,7 @@ def main() -> None:
     source = Path(args.source)
 
     print(c_header(
-        f"\n╔══ autotest v4 ════════════════════════════════════════════════╗\n"
+        f"\n╔══ autotest v5 ════════════════════════════════════════════════╗\n"
         f"║  Target : {str(source):<54}║\n"
         f"╚═══════════════════════════════════════════════════════════════╝\n"
     ))
@@ -578,12 +542,10 @@ def main() -> None:
         print(c_fail(f"✗ Unsupported source type '{source.suffix}'. Use .cpp or .py."))
         sys.exit(1)
 
-    # ── Secure temporary binary (guaranteed cleanup via finally) ──────
     tmp_fd, tmp_binary = tempfile.mkstemp(prefix="autotest_")
     os.close(tmp_fd)
 
     try:
-        # ── Compilation ───────────────────────────────────────────────
         bin_path: Optional[str] = None
         cmd: List[str]
 
@@ -610,13 +572,11 @@ def main() -> None:
         else:  # .py
             cmd = [sys.executable, str(source)]
 
-        # ── Test discovery ────────────────────────────────────────────
         tests = discover_tests(args.tests_dir)
         if not tests:
             print(c_warn(f"No test cases found in '{args.tests_dir}/'."))
             sys.exit(0)
 
-        # ── Valgrind availability ─────────────────────────────────────
         use_valgrind = (
             is_cpp
             and not args.no_valgrind
@@ -627,23 +587,19 @@ def main() -> None:
             ).returncode == 0
         )
 
-        # ── Run tests ─────────────────────────────────────────────────
-        results     = execute_tests(cmd, tests, args.timeout, use_valgrind, bin_path)
+        results     = execute_tests(cmd, tests, args.timeout, use_valgrind, bin_path, max_workers=args.workers)
         any_failure = any(not r.passed or r.mem_ok is False for r in results)
         print_summary(results)
 
-        # ── Git ───────────────────────────────────────────────────────
         if args.save:
             print_git_result(run_git_workflow(args.save))
 
-        # ── Pack ──────────────────────────────────────────────────────
         if args.pack:
             pack_submission(args.pack, any_failure)
 
         sys.exit(1 if any_failure else 0)
 
     finally:
-        # Unconditional cleanup: runs even on sys.exit(), exceptions, or Ctrl-C.
         if Path(tmp_binary).exists():
             os.unlink(tmp_binary)
 
