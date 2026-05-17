@@ -5,6 +5,7 @@ Strict-compilation, I/O diffing, Valgrind, and Git workflow in one command.
 """
 
 import argparse
+import concurrent.futures
 import difflib
 import glob
 import os
@@ -16,7 +17,7 @@ import time
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 
 # ─────────────────────────────────────────────────────────────── Palette ──
@@ -306,15 +307,15 @@ def _render_diff(diff: str) -> None:
     while i < len(lines):
         line = lines[i]
 
-        if line.startswith("-") and not line.startswith("--- "):
+        if line.startswith("-") and not line.startswith("---"):
             # Collect the full run of deleted lines
             del_buf: List[str] = []
-            while i < len(lines) and lines[i].startswith("-") and not lines[i].startswith("--- "):
+            while i < len(lines) and lines[i].startswith("-") and not lines[i].startswith("---"):
                 del_buf.append(lines[i][1:])
                 i += 1
             # Collect the full run of added lines immediately following
             add_buf: List[str] = []
-            while i < len(lines) and lines[i].startswith("+") and not lines[i].startswith("+++ "):
+            while i < len(lines) and lines[i].startswith("+") and not lines[i].startswith("+++"):
                 add_buf.append(lines[i][1:])
                 i += 1
 
@@ -332,7 +333,7 @@ def _render_diff(diff: str) -> None:
             for j in range(pairs, len(add_buf)):
                 print(c_ok(f"   +{add_buf[j]}"))
 
-        elif line.startswith("+") and not line.startswith("+++ "):
+        elif line.startswith("+") and not line.startswith("+++"):
             print(c_ok(f"   {line}"))
             i += 1
         else:
