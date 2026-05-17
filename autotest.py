@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import argparse, difflib, os, re, subprocess, sys, time
+import argparse, difflib, os, re, subprocess, sys, time, zipfile, glob
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
@@ -109,6 +109,7 @@ def execute_tests(cmd, tests, tout, use_vg, bin_path):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("source"); p.add_argument("--save"); p.add_argument("--no-valgrind", action="store_true")
+    p.add_argument("--pack", metavar="ID", help="Generate a secure Moodle submission .zip if tests pass")
     args = p.parse_args()
     
     print(c_header(f"\n╔══ autotest v2 ════════════════════════════════════════════════╗\n║  Target : {args.source:<54}║\n╚═══════════════════════════════════════════════════════════════╝\n"))
@@ -129,14 +130,28 @@ def main():
     vg = args.source.endswith(".cpp") and not args.no_valgrind and subprocess.run(["which", "valgrind"], stdout=subprocess.DEVNULL).returncode == 0
     res = execute_tests([bin_path] if args.source.endswith(".cpp") else [sys.executable, args.source], tests, 5.0, vg, bin_path)
     
+    fail = any(not r.passed or r.mem_ok is False for r in res)
+
     if args.save:
         gr = run_git_workflow(args.save)
         print(c_git("\n  GIT WORKFLOW\n" + "─"*64))
         print(f"  {'✓' if gr.add_ok else '✗'} git add .")
         if gr.commit_ok: print(f"  ✓ git commit -m \"[Autotest] {gr.commit_msg}\"")
         if gr.push_ok: print("  ✓ git push")
+        
+    if args.pack:
+        print(c_info("\n  MOODLE PACKAGER\n" + "─"*64))
+        if fail:
+            print(c_fail("  ✗ Tests failed! Packing aborted to prevent a bad submission."))
+        else:
+            zname = f"{args.pack}.zip"
+            with zipfile.ZipFile(zname, 'w') as zf:
+                for ext in ("*.cpp", "*.h", "*.pdf", "Makefile", "makefile"):
+                    for f in glob.glob(ext):
+                        zf.write(f); print(c_dim(f"   → added {f}"))
+            print(c_ok(f"  ✓ Success! Ready for Moodle: {zname}"))
     
     if bin_path and bin_path == _BINARY_PATH and os.path.exists(bin_path): os.remove(bin_path)
-    sys.exit(1 if any(not r.passed or r.mem_ok is False for r in res) else 0)
+    sys.exit(1 if fail else 0)
 
 if __name__ == "__main__": main()
